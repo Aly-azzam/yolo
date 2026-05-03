@@ -1,39 +1,41 @@
 """
-Standalone Roboflow scissors YOLO test API:
-upload video, run Roboflow detection, serve annotated results.
+Standalone scissors YOLO test API:
+upload video, run local YOLO detection, serve annotated results.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
-import tempfile
 import uuid
 from pathlib import Path
+from typing import Any
 
 import cv2
+import numpy as np
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from inference_sdk import InferenceHTTPClient
 from pydantic import BaseModel
+from ultralytics import YOLO
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA_INPUT = ROOT / "data" / "input"
 DATA_OUTPUT = ROOT / "data" / "output"
 FRONTEND_DIR = ROOT / "frontend"
+YOLO_MODEL_PATH = ROOT / "models" / "best.pt"
 
 load_dotenv(ROOT / ".env")
 
-ROBOFLOW_API_KEY = os.getenv("ROBOFLOW_API_KEY", "").strip()
-ROBOFLOW_MODEL_ID = os.getenv(
-    "ROBOFLOW_MODEL_ID",
-    "alis-workspace-awjkp/scissors-egocentric-instant-1",
-).strip()
-ROBOFLOW_CONFIDENCE = float(os.getenv("ROBOFLOW_CONFIDENCE", "0.5"))
-DEFAULT_FRAME_STRIDE = int(os.getenv("FRAME_STRIDE", "3"))
+YOLO_CONFIDENCE = float(os.getenv("YOLO_CONFIDENCE", "0.25"))
+DEFAULT_FRAME_STRIDE = int(os.getenv("FRAME_STRIDE", "1"))
+ANGLE_JUMP_LIMIT_DEGREES = 35.0
+LOW_CONFIDENCE_ANGLE_THRESHOLD = 0.35
+MIN_BLADE_CONTOUR_AREA = 40.0
+MIN_BLADE_ASPECT_RATIO = 2.0
 DRAW_REJECTED_DEBUG = os.getenv("DRAW_REJECTED_DEBUG", "false").strip().lower() in {
     "1",
     "true",
@@ -41,7 +43,7 @@ DRAW_REJECTED_DEBUG = os.getenv("DRAW_REJECTED_DEBUG", "false").strip().lower() 
     "on",
 }
 
-app = FastAPI(title="Roboflow Scissors YOLO Test")
+app = FastAPI(title="Local Scissors YOLO Test")
 
 app.add_middleware(
     CORSMiddleware,
@@ -53,7 +55,7 @@ app.add_middleware(
 
 DATA_INPUT.mkdir(parents=True, exist_ok=True)
 DATA_OUTPUT.mkdir(parents=True, exist_ok=True)
-rf_client: InferenceHTTPClient | None = None
+yolo_model: YOLO | None = None
 
 app.mount("/media/output", StaticFiles(directory=str(DATA_OUTPUT)), name="output_media")
 
@@ -68,11 +70,10 @@ def serve_index() -> FileResponse:
 
 @app.get("/api/config/status")
 def config_status() -> dict:
-    model_id = os.getenv("ROBOFLOW_MODEL_ID", ROBOFLOW_MODEL_ID).strip()
     return {
-        "roboflow_api_key_present": bool(ROBOFLOW_API_KEY),
-        "roboflow_model_id": model_id,
-        "confidence": ROBOFLOW_CONFIDENCE,
+        "yolo_model_path": YOLO_MODEL_PATH.relative_to(ROOT).as_posix(),
+        "yolo_model_present": YOLO_MODEL_PATH.is_file(),
+        "confidence": YOLO_CONFIDENCE,
         "default_frame_stride": DEFAULT_FRAME_STRIDE,
     }
 
@@ -106,58 +107,54 @@ class DetectRequest(BaseModel):
     frame_stride: int | None = None
 
 
-def get_roboflow_client() -> InferenceHTTPClient:
-    global rf_client
-    if not ROBOFLOW_API_KEY:
+def get_yolo_model() -> YOLO:
+    global yolo_model
+    if not YOLO_MODEL_PATH.is_file():
         raise HTTPException(
-            status_code=500,
-            detail="Missing ROBOFLOW_API_KEY in .env",
+            status_code=503,
+            detail=f"best.pt does not exist. Put your trained model at {YOLO_MODEL_PATH}",
         )
-    if rf_client is None:
-        rf_client = InferenceHTTPClient(
-            api_url="https://serverless.roboflow.com",
-            api_key=ROBOFLOW_API_KEY,
-        )
-    return rf_client
+    if yolo_model is None:
+        yolo_model = YOLO(str(YOLO_MODEL_PATH))
+    return yolo_model
 
 
-def call_roboflow(frame_path: Path) -> list[dict]:
-    model_id = os.getenv("ROBOFLOW_MODEL_ID", ROBOFLOW_MODEL_ID).strip()
-    if not model_id:
-        raise HTTPException(
-            status_code=500,
-            detail="Missing ROBOFLOW_MODEL_ID in .env",
-        )
-
+def detect_scissors(frame: Any, model: YOLO) -> list[dict]:
     try:
-        client = get_roboflow_client()
-        result = client.infer(str(frame_path), model_id=model_id)
-    except HTTPException:
-        raise
+        results = model.predict(source=frame, conf=YOLO_CONFIDENCE, verbose=False)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=502,
-            detail=f"Roboflow inference error: {str(exc)[:300]}",
+            detail=f"YOLO inference error: {str(exc)[:300]}",
         ) from exc
 
-    predictions = result.get("predictions", [])
-    if isinstance(predictions, list):
-        return predictions
-    return []
+    if not results:
+        return []
 
+    result = results[0]
+    boxes = getattr(result, "boxes", None)
+    if boxes is None or len(boxes) == 0:
+        return []
 
-def xywh_to_xyxy(pred: dict) -> list[float]:
-    x = float(pred["x"])
-    y = float(pred["y"])
-    w = float(pred["width"])
-    h = float(pred["height"])
+    names = _result_names(result, model)
+    xyxy_values = boxes.xyxy.detach().cpu().numpy()
+    confidence_values = boxes.conf.detach().cpu().numpy()
+    class_values = boxes.cls.detach().cpu().numpy() if boxes.cls is not None else [None] * len(boxes)
 
-    return [
-        x - w / 2,
-        y - h / 2,
-        x + w / 2,
-        y + h / 2,
-    ]
+    predictions: list[dict] = []
+    for bbox, conf, class_id in zip(xyxy_values, confidence_values, class_values):
+        x1, y1, x2, y2 = [float(value) for value in bbox.tolist()]
+        predictions.append(
+            {
+                "class": _class_name(names, class_id) or "scissors",
+                "confidence": float(conf),
+                "bbox": [x1, y1, x2, y2],
+                "width": max(0.0, x2 - x1),
+                "height": max(0.0, y2 - y1),
+            }
+        )
+
+    return predictions
 
 
 def pick_best_scissors(
@@ -165,44 +162,28 @@ def pick_best_scissors(
     frame_width: int,
     frame_height: int,
 ) -> tuple[dict | None, list[dict]]:
-    best: dict | None = None
-    best_score = float("-inf")
-    best_conf = 0.0
-    best_area_ratio = 1.0
     frame_area = max(1.0, float(frame_width * frame_height))
     raw_debug: list[dict] = []
+    class_names = [str(pred.get("class", "")).lower().strip() for pred in predictions]
+    has_scissors_class = any("scissor" in class_name for class_name in class_names)
+    candidates: list[dict] = []
 
     for pred in predictions:
         cls = str(pred.get("class", "")).lower().strip()
         conf = float(pred.get("confidence", 0.0))
-        bbox = xywh_to_xyxy(pred)
+        bbox = [float(value) for value in pred["bbox"]]
         w = max(0.0, float(pred.get("width", 0.0)))
         h = max(0.0, float(pred.get("height", 0.0)))
         area_ratio = (w * h) / frame_area
         aspect_ratio = h / max(w, 1e-6)
-        accepted = True
-        rejection_reason: str | None = None
-
-        if "scissors" not in cls:
-            accepted = False
-            rejection_reason = "not_scissors"
-        elif conf < ROBOFLOW_CONFIDENCE:
-            accepted = False
+        accepted = conf >= YOLO_CONFIDENCE and (
+            "scissor" in cls or not has_scissors_class
+        )
+        rejection_reason = None
+        if conf < YOLO_CONFIDENCE:
             rejection_reason = "low_confidence"
-        elif area_ratio > 0.18:
-            accepted = False
-            rejection_reason = "too_large"
-        elif area_ratio < 0.002:
-            accepted = False
-            rejection_reason = "too_small"
-        elif aspect_ratio < 1.2:
-            accepted = False
-            rejection_reason = "too_wide"
-
-        score = conf
-        if aspect_ratio >= 2.0:
-            score += 0.15
-        score -= area_ratio * 1.5
+        elif has_scissors_class and "scissor" not in cls:
+            rejection_reason = "not_scissors"
 
         raw_debug.append(
             {
@@ -213,26 +194,13 @@ def pick_best_scissors(
                 "aspect_ratio": round(aspect_ratio, 6),
                 "accepted": accepted,
                 "rejection_reason": rejection_reason,
-                "score": round(score, 6),
             }
         )
 
-        if not accepted:
-            continue
+        if accepted:
+            candidates.append(pred)
 
-        choose_this = False
-        if best is None or score > best_score:
-            choose_this = True
-        else:
-            conf_close = abs(conf - best_conf) <= 0.05
-            score_close = abs(score - best_score) <= 0.03
-            if conf_close and score_close and area_ratio < best_area_ratio:
-                choose_this = True
-        if choose_this:
-            best = pred
-            best_score = score
-            best_conf = conf
-            best_area_ratio = area_ratio
+    best = max(candidates, key=lambda pred: float(pred.get("confidence", 0.0)), default=None)
     return best, raw_debug
 
 
@@ -261,9 +229,9 @@ def run_yolo_detect(body: DetectRequest) -> dict:
         cap.release()
         raise HTTPException(status_code=400, detail="Invalid video dimensions")
 
-    out_video_path = DATA_OUTPUT / f"{video_id}_roboflow_yolo.mp4"
-    tmp_video_path = DATA_OUTPUT / f"{video_id}_roboflow_yolo.tmp.mp4"
-    out_json_path = DATA_OUTPUT / f"{video_id}_roboflow_yolo.json"
+    out_video_path = DATA_OUTPUT / f"{video_id}_local_yolo.mp4"
+    tmp_video_path = DATA_OUTPUT / f"{video_id}_local_yolo.tmp.mp4"
+    out_json_path = DATA_OUTPUT / f"{video_id}_local_yolo.json"
 
     writer = cv2.VideoWriter(
         str(tmp_video_path),
@@ -281,6 +249,8 @@ def run_yolo_detect(body: DetectRequest) -> dict:
     detections_count = 0
     last_bbox: list[float] | None = None
     last_confidence = 0.0
+    previous_angle: float | None = None
+    model = get_yolo_model()
 
     try:
         while True:
@@ -294,20 +264,12 @@ def run_yolo_detect(body: DetectRequest) -> dict:
             all_detections_count = 0
 
             if frame_index % frame_stride == 0:
-                with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_file:
-                    frame_path = Path(tmp_file.name)
-                try:
-                    if not cv2.imwrite(str(frame_path), frame):
-                        raise HTTPException(status_code=500, detail="Could not write temp frame")
-                    predictions = call_roboflow(frame_path)
-                finally:
-                    if frame_path.exists():
-                        frame_path.unlink()
+                predictions = detect_scissors(frame, model)
                 picked, raw_predictions = pick_best_scissors(predictions, width, height)
                 all_detections_count = len(predictions)
 
                 if picked is not None:
-                    bbox = xywh_to_xyxy(picked)
+                    bbox = [float(value) for value in picked["bbox"]]
                     confidence = float(picked.get("confidence", 0.0))
                     last_bbox = bbox
                     last_confidence = confidence
@@ -335,6 +297,8 @@ def run_yolo_detect(body: DetectRequest) -> dict:
 
             if bbox is not None:
                 x1, y1, x2, y2 = map(int, bbox)
+                center_x = (x1 + x2) / 2.0
+                center_y = (y1 + y2) / 2.0
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(
                     frame,
@@ -346,6 +310,23 @@ def run_yolo_detect(body: DetectRequest) -> dict:
                     2,
                     cv2.LINE_AA,
                 )
+
+                bbox_angle = angle_from_points((x1, y1), (x2, y2))
+                blade_angle = estimate_blade_angle_from_crop(frame, (x1, y1, x2, y2))
+                if previous_angle is None:
+                    angle_to_draw = blade_angle if blade_angle is not None else bbox_angle
+                elif blade_angle is None or confidence < LOW_CONFIDENCE_ANGLE_THRESHOLD:
+                    angle_to_draw = previous_angle
+                else:
+                    jump = abs(angle_delta_degrees(previous_angle, blade_angle))
+                    if jump > ANGLE_JUMP_LIMIT_DEGREES:
+                        angle_to_draw = previous_angle
+                    else:
+                        angle_to_draw = smooth_angle(previous_angle, blade_angle)
+
+                start, end = extend_angle_line(angle_to_draw, center_x, center_y, width, height)
+                cv2.line(frame, start, end, (0, 255, 0), 4)
+                previous_angle = angle_to_draw
 
             frames.append(
                 {
@@ -378,17 +359,13 @@ def run_yolo_detect(body: DetectRequest) -> dict:
         out_video_path.unlink()
     tmp_video_path.replace(out_video_path)
 
-    model_id = os.getenv("ROBOFLOW_MODEL_ID", ROBOFLOW_MODEL_ID).strip()
-    if not model_id:
-        raise HTTPException(status_code=500, detail="Missing ROBOFLOW_MODEL_ID in .env")
-
     payload = {
         "video_id": video_id,
         "frame_count": frame_index,
         "frame_stride": frame_stride,
         "detections_count": detections_count,
-        "model_id": model_id,
-        "confidence_threshold": ROBOFLOW_CONFIDENCE,
+        "model_path": YOLO_MODEL_PATH.relative_to(ROOT).as_posix(),
+        "confidence_threshold": YOLO_CONFIDENCE,
         "frames": frames,
     }
 
@@ -401,5 +378,131 @@ def run_yolo_detect(body: DetectRequest) -> dict:
         "frame_count": frame_index,
         "frame_stride": frame_stride,
         "detections_count": detections_count,
-        "annotated_video_url": f"/media/output/{video_id}_roboflow_yolo.mp4",
+        "annotated_video_url": f"/media/output/{video_id}_local_yolo.mp4",
     }
+
+
+def _result_names(result: Any, model: YOLO) -> dict[int, str]:
+    names = getattr(result, "names", None) or getattr(model, "names", None) or {}
+    return {int(key): str(value) for key, value in dict(names).items()}
+
+
+def _class_name(names: dict[int, str], class_id: Any) -> str | None:
+    if class_id is None:
+        return None
+    return names.get(int(class_id), str(int(class_id)))
+
+
+def estimate_blade_angle_from_crop(
+    frame: Any,
+    bbox: tuple[int, int, int, int],
+) -> float | None:
+    frame_height, frame_width = frame.shape[:2]
+    x1, y1, x2, y2 = bbox
+    x1 = max(0, min(frame_width - 1, x1))
+    x2 = max(0, min(frame_width, x2))
+    y1 = max(0, min(frame_height - 1, y1))
+    y2 = max(0, min(frame_height, y2))
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    crop = frame[y1:y2, x1:x2]
+    if crop.size == 0:
+        return None
+
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+
+    metal_lower = np.array([0, 0, 100])
+    metal_upper = np.array([180, 80, 255])
+    metal_mask = cv2.inRange(hsv, metal_lower, metal_upper)
+
+    skin_lower = np.array([0, 30, 60])
+    skin_upper = np.array([25, 180, 255])
+    skin_mask_1 = cv2.inRange(hsv, skin_lower, skin_upper)
+    skin_mask_2 = cv2.inRange(hsv, np.array([160, 30, 60]), np.array([180, 180, 255]))
+    skin_mask = cv2.bitwise_or(skin_mask_1, skin_mask_2)
+    mask = cv2.bitwise_and(metal_mask, cv2.bitwise_not(skin_mask))
+
+    kernel = np.ones((3, 3), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    contour = choose_longest_blade_contour(contours)
+    if contour is None:
+        return None
+
+    points = contour.reshape(-1, 2).astype(np.float32)
+    points[:, 0] += x1
+    points[:, 1] += y1
+    if len(points) < 2:
+        return None
+
+    vx, vy, _, _ = cv2.fitLine(points, cv2.DIST_L2, 0, 0.01, 0.01).flatten()
+    return normalize_angle_180(math.degrees(math.atan2(float(vy), float(vx))))
+
+
+def choose_longest_blade_contour(contours: tuple[Any, ...]) -> Any | None:
+    best_contour = None
+    best_length = 0.0
+
+    for contour in contours:
+        area = cv2.contourArea(contour)
+        if area <= MIN_BLADE_CONTOUR_AREA:
+            continue
+
+        (_, _), (width, height), _ = cv2.minAreaRect(contour)
+        short_side = min(width, height)
+        long_side = max(width, height)
+        if short_side <= 0:
+            continue
+
+        aspect_ratio = long_side / short_side
+        if aspect_ratio <= MIN_BLADE_ASPECT_RATIO:
+            continue
+
+        if long_side > best_length:
+            best_contour = contour
+            best_length = long_side
+
+    return best_contour
+
+
+def extend_angle_line(
+    angle_degrees: float,
+    center_x: float,
+    center_y: float,
+    frame_width: int,
+    frame_height: int,
+    scale: int = 2,
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    length = max(frame_width, frame_height) * scale
+    angle_radians = math.radians(angle_degrees)
+    ux = math.cos(angle_radians)
+    uy = math.sin(angle_radians)
+
+    start = (int(center_x - ux * length), int(center_y - uy * length))
+    end = (int(center_x + ux * length), int(center_y + uy * length))
+
+    return start, end
+
+
+def angle_from_points(p1: tuple[int, int], p2: tuple[int, int]) -> float:
+    x1, y1 = p1
+    x2, y2 = p2
+    return normalize_angle_180(math.degrees(math.atan2(y2 - y1, x2 - x1)))
+
+
+def normalize_angle_180(angle: float) -> float:
+    return angle % 180.0
+
+
+def angle_delta_degrees(previous_angle: float, current_angle: float) -> float:
+    return ((current_angle - previous_angle + 90.0) % 180.0) - 90.0
+
+
+def smooth_angle(previous_angle: float, current_angle: float) -> float:
+    delta = angle_delta_degrees(previous_angle, current_angle)
+    return normalize_angle_180(previous_angle + 0.6 * delta)
+

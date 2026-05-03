@@ -21,4 +21,6 @@ __pycache__/
 build/**
 _C.*/**
 outputs/**
+models/*.pt
+*.pt
 
