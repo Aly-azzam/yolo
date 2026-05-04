@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +83,9 @@ def process_video_with_vertical_line(
     output = resolve_output_path(video, output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
+    tmp_avi = output.with_suffix(".tmp.avi")
+    tmp_mp4 = output.with_suffix(".tmp.mp4")
+
     model = YOLO(str(model_file))
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
@@ -95,8 +99,8 @@ def process_video_with_vertical_line(
         raise RuntimeError(f"Invalid video dimensions for {video}")
 
     writer = cv2.VideoWriter(
-        str(output),
-        cv2.VideoWriter_fourcc(*"mp4v"),
+        str(tmp_avi),
+        cv2.VideoWriter_fourcc(*"MJPG"),
         fps,
         (frame_width, frame_height),
     )
@@ -143,11 +147,66 @@ def process_video_with_vertical_line(
         cap.release()
         writer.release()
 
+    if frame_index == 0:
+        if tmp_avi.exists():
+            tmp_avi.unlink()
+        raise RuntimeError("No frames were processed from the input video")
+
+    try:
+        transcode_avi_mjpeg_to_h264_mp4(input_avi=tmp_avi, output_mp4=tmp_mp4, fps=fps)
+    finally:
+        if tmp_avi.exists():
+            tmp_avi.unlink()
+
+    if output.exists():
+        output.unlink()
+    tmp_mp4.replace(output)
+
     print(
         f"Finished {frame_index} frames; detections={detections_count}",
         flush=True,
     )
     return output
+
+
+def transcode_avi_mjpeg_to_h264_mp4(*, input_avi: Path, output_mp4: Path, fps: float) -> None:
+    import imageio_ffmpeg
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    if output_mp4.exists():
+        output_mp4.unlink()
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(input_avi),
+        "-an",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "veryfast",
+        "-crf",
+        "23",
+        "-movflags",
+        "+faststart",
+        "-r",
+        str(fps),
+        str(output_mp4),
+    ]
+
+    completed = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if completed.returncode != 0:
+        stderr = (completed.stderr or "").strip()
+        raise RuntimeError(stderr or f"ffmpeg failed with code {completed.returncode}")
+
+    if not output_mp4.is_file() or output_mp4.stat().st_size <= 0:
+        raise RuntimeError("ffmpeg produced an empty output file")
 
 
 def resolve_output_path(video: Path, output_path: str | Path | None) -> Path:

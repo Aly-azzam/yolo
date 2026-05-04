@@ -1,6 +1,5 @@
 *.mp4
 data/**
-backend/**
 app/outputs/**
 node_modules/**
 dist/**
@@ -11,6 +10,7 @@ __pycache__/
 *.pyc/**
 /sam2/
 outputs/**
+storage/**
 frontend/**
 .vscode/
 .DS_Store/**
