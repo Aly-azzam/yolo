@@ -403,6 +403,7 @@ async def run_compare(
     expert_input = await save_uploaded_video(expert_video, f"{run_id}_expert")
     learner_input = await save_uploaded_video(learner_video, f"{run_id}_learner")
 
+    # ── Step 1: process expert video ────────────────────────────────────────
     expert_result = process_video_with_scissors_line(
         input_path=expert_input,
         output_stem=f"{run_id}_expert_output",
@@ -413,17 +414,19 @@ async def run_compare(
     )
     expert_reference_angle = compute_expert_reference_angle(ROOT / expert_result.json_path)
 
-    learner_result = process_video_with_scissors_line(
+    # ── Step 2: first pass on learner — angle extraction only, no blue line ─
+    learner_first_pass = process_video_with_scissors_line(
         input_path=learner_input,
-        output_stem=f"{run_id}_learner_comparison_output",
+        output_stem=f"{run_id}_learner_firstpass",
         frame_stride=stride,
-        expert_reference_angle=expert_reference_angle,
         output_dir=DATA_OUTPUT,
-        output_video_name=f"{run_id}_learner_comparison_output.mp4",
-        output_json_name=f"{run_id}_learner_comparison.json",
+        output_video_name=f"{run_id}_learner_firstpass.mp4",
+        output_json_name=f"{run_id}_learner_firstpass.json",
     )
+
+    # ── Step 3: extract valid angle sequences and run DTW ───────────────────
     expert_frames = extract_valid_line_frames(ROOT / expert_result.json_path)
-    learner_frames = extract_valid_line_frames(ROOT / learner_result.json_path)
+    learner_frames = extract_valid_line_frames(ROOT / learner_first_pass.json_path)
     expert_angles = [frame["line_angle"] for frame in expert_frames]
     learner_angles = [frame["line_angle"] for frame in learner_frames]
     dtw_result = run_dtw(
@@ -436,6 +439,39 @@ async def run_compare(
         expert_frames=expert_frames,
         learner_frames=learner_frames,
     )
+
+    # ── Step 4: build learner-frame → expert-angle lookup from DTW path ─────
+    # When multiple DTW steps map to the same learner frame, the last match
+    # in the path wins (DTW path is ordered so later entries are more recent).
+    learner_frame_to_expert_angle: dict[int, float] = {
+        int(match["learner_frame_index"]): float(match["expert_angle"])
+        for match in dtw_result["matches"]
+    }
+
+    # ── Step 5: second pass on learner — render with dynamic blue line ───────
+    learner_result = process_video_with_scissors_line(
+        input_path=learner_input,
+        output_stem=f"{run_id}_learner_comparison_output",
+        frame_stride=stride,
+        expert_reference_angle=expert_reference_angle,
+        learner_frame_to_expert_angle=learner_frame_to_expert_angle,
+        output_dir=DATA_OUTPUT,
+        output_video_name=f"{run_id}_learner_comparison_output.mp4",
+        output_json_name=f"{run_id}_learner_comparison.json",
+    )
+
+    # ── Step 6: clean up first-pass temp files ───────────────────────────────
+    for _tmp in [
+        ROOT / learner_first_pass.output_video_path,
+        ROOT / learner_first_pass.json_path,
+    ]:
+        try:
+            if _tmp.exists():
+                _tmp.unlink()
+        except OSError:
+            pass
+
+    # ── Step 7: build DTW aligned preview ────────────────────────────────────
     run_dir = SCISSORS_LINE_RUNS / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
     dtw_preview_path = run_dir / "dtw_aligned_preview.mp4"
@@ -546,6 +582,7 @@ def process_video_with_scissors_line(
     output_stem: str,
     frame_stride: int,
     expert_reference_angle: float | None = None,
+    learner_frame_to_expert_angle: dict[int, float] | None = None,
     output_dir: Path = DATA_OUTPUT,
     output_video_name: str | None = None,
     output_json_name: str | None = None,
@@ -603,6 +640,7 @@ def process_video_with_scissors_line(
             line_center = None
             line_angle = None
             angle_difference = None
+            frame_ref_angle: float | None = None
             valid_line = False
 
             if frame_index % frame_stride == 0:
@@ -667,9 +705,18 @@ def process_video_with_scissors_line(
                     else:
                         angle_to_draw = smooth_angle(previous_angle, blade_angle)
 
-                if expert_reference_angle is not None:
+                # Determine the per-frame expert reference angle.
+                # A DTW-based mapping takes priority; the fixed median is the fallback.
+                if learner_frame_to_expert_angle is not None:
+                    frame_ref_angle = learner_frame_to_expert_angle.get(
+                        frame_index, expert_reference_angle
+                    )
+                else:
+                    frame_ref_angle = expert_reference_angle
+
+                if frame_ref_angle is not None:
                     ref_start, ref_end = extend_angle_line(
-                        expert_reference_angle,
+                        frame_ref_angle,
                         center_x,
                         center_y,
                         width,
@@ -682,29 +729,29 @@ def process_video_with_scissors_line(
                 previous_angle = angle_to_draw
                 line_angle = round(float(angle_to_draw), 6)
                 valid_line = True
-                if expert_reference_angle is not None:
+                if frame_ref_angle is not None:
                     angle_difference = round(
-                        angle_difference_degrees(angle_to_draw, expert_reference_angle),
+                        angle_difference_degrees(angle_to_draw, frame_ref_angle),
                         6,
                     )
                     draw_angle_difference_arc(
                         frame,
                         center=(center_x, center_y),
                         learner_angle=angle_to_draw,
-                        expert_reference_angle=expert_reference_angle,
+                        expert_reference_angle=frame_ref_angle,
                         angle_difference=angle_difference,
                     )
                     draw_learner_compare_text(
                         frame,
                         learner_angle=angle_to_draw,
-                        expert_reference_angle=expert_reference_angle,
+                        expert_reference_angle=frame_ref_angle,
                         angle_difference=angle_difference,
                     )
                     learner_frames.append(
                         {
                             "frame_index": frame_index,
                             "learner_angle": line_angle,
-                            "expert_reference_angle": round(float(expert_reference_angle), 6),
+                            "expert_reference_angle": round(float(frame_ref_angle), 6),
                             "angle_difference": angle_difference,
                         }
                     )
@@ -718,8 +765,8 @@ def process_video_with_scissors_line(
                     "line_center": line_center,
                     "line_angle": line_angle,
                     "expert_reference_angle": (
-                        round(float(expert_reference_angle), 6)
-                        if expert_reference_angle is not None and valid_line
+                        round(float(frame_ref_angle), 6)
+                        if frame_ref_angle is not None and valid_line
                         else None
                     ),
                     "angle_difference": angle_difference,
