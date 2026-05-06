@@ -399,36 +399,46 @@ async def run_compare(
 ) -> dict:
     run_id = str(uuid.uuid4())
     stride = max(1, int(frame_stride or DEFAULT_FRAME_STRIDE))
+    run_dir = SCISSORS_LINE_RUNS / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     expert_input = await save_uploaded_video(expert_video, f"{run_id}_expert")
     learner_input = await save_uploaded_video(learner_video, f"{run_id}_learner")
 
-    # ── Step 1: process expert video ────────────────────────────────────────
+    print("Processing expert video...")
     expert_result = process_video_with_scissors_line(
         input_path=expert_input,
-        output_stem=f"{run_id}_expert_output",
+        output_stem="expert_output",
         frame_stride=stride,
-        output_dir=DATA_OUTPUT,
-        output_video_name=f"{run_id}_expert_output.mp4",
-        output_json_name=f"{run_id}_expert_lines.json",
+        output_dir=run_dir,
+        output_video_name="expert_output.mp4",
+        output_json_name="expert_frames.json",
+        video_type="expert",
     )
+    expert_frames_payload = json.loads((ROOT / expert_result.json_path).read_text(encoding="utf-8"))
+    print("Saved expert_frames.json")
     expert_reference_angle = compute_expert_reference_angle(ROOT / expert_result.json_path)
 
-    # ── Step 2: first pass on learner — angle extraction only, no blue line ─
+    print("Processing learner video...")
     learner_first_pass = process_video_with_scissors_line(
         input_path=learner_input,
-        output_stem=f"{run_id}_learner_firstpass",
+        output_stem="learner_firstpass",
         frame_stride=stride,
-        output_dir=DATA_OUTPUT,
-        output_video_name=f"{run_id}_learner_firstpass.mp4",
-        output_json_name=f"{run_id}_learner_firstpass.json",
+        output_dir=run_dir,
+        output_video_name="learner_firstpass.mp4",
+        output_json_name="learner_frames.json",
+        video_type="learner",
     )
+    learner_frames_payload = json.loads(
+        (ROOT / learner_first_pass.json_path).read_text(encoding="utf-8")
+    )
+    print("Saved learner_frames.json")
 
-    # ── Step 3: extract valid angle sequences and run DTW ───────────────────
     expert_frames = extract_valid_line_frames(ROOT / expert_result.json_path)
     learner_frames = extract_valid_line_frames(ROOT / learner_first_pass.json_path)
     expert_angles = [frame["line_angle"] for frame in expert_frames]
     learner_angles = [frame["line_angle"] for frame in learner_frames]
+    print("Running DTW...")
     dtw_result = run_dtw(
         expert_angles,
         learner_angles,
@@ -439,41 +449,48 @@ async def run_compare(
         expert_frames=expert_frames,
         learner_frames=learner_frames,
     )
+    dtw_alignment_payload = build_dtw_alignment_payload(
+        dtw_result,
+        expert_valid_frame_count=len(expert_frames),
+        learner_valid_frame_count=len(learner_frames),
+    )
+    dtw_alignment_path = run_dir / "dtw_alignment.json"
+    write_json_file(dtw_alignment_path, dtw_alignment_payload)
+    print("Saved dtw_alignment.json")
 
-    # ── Step 4: build learner-frame → expert-angle lookup from DTW path ─────
-    # When multiple DTW steps map to the same learner frame, the last match
-    # in the path wins (DTW path is ordered so later entries are more recent).
-    learner_frame_to_expert_angle: dict[int, float] = {
-        int(match["learner_frame_index"]): float(match["expert_angle"])
-        for match in dtw_result["matches"]
+    learner_comparison_payload = build_learner_comparison_payload(
+        learner_frames_payload=learner_frames_payload,
+        dtw_alignment_payload=dtw_alignment_payload,
+    )
+    learner_comparison_path = run_dir / "learner_angle_comparison.json"
+    write_json_file(learner_comparison_path, learner_comparison_payload)
+    print("Saved learner_angle_comparison.json")
+
+    learner_frame_to_expert_angle = {
+        int(frame["frame_index"]): float(frame["matched_expert_angle"])
+        for frame in learner_comparison_payload["frames"]
+        if frame.get("matched_expert_angle") is not None
     }
 
-    # ── Step 5: second pass on learner — render with dynamic blue line ───────
     learner_result = process_video_with_scissors_line(
         input_path=learner_input,
-        output_stem=f"{run_id}_learner_comparison_output",
+        output_stem="learner_comparison_output",
         frame_stride=stride,
         expert_reference_angle=expert_reference_angle,
         learner_frame_to_expert_angle=learner_frame_to_expert_angle,
-        output_dir=DATA_OUTPUT,
-        output_video_name=f"{run_id}_learner_comparison_output.mp4",
-        output_json_name=f"{run_id}_learner_comparison.json",
+        output_dir=run_dir,
+        output_video_name="learner_comparison_output.mp4",
+        output_json_name="learner_comparison_render.json",
+        write_json=False,
     )
 
-    # ── Step 6: clean up first-pass temp files ───────────────────────────────
-    for _tmp in [
-        ROOT / learner_first_pass.output_video_path,
-        ROOT / learner_first_pass.json_path,
-    ]:
-        try:
-            if _tmp.exists():
-                _tmp.unlink()
-        except OSError:
-            pass
+    firstpass_video_path = ROOT / learner_first_pass.output_video_path
+    try:
+        if firstpass_video_path.exists():
+            firstpass_video_path.unlink()
+    except OSError:
+        pass
 
-    # ── Step 7: build DTW aligned preview ────────────────────────────────────
-    run_dir = SCISSORS_LINE_RUNS / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
     dtw_preview_path = run_dir / "dtw_aligned_preview.mp4"
     create_dtw_aligned_preview(
         expert_video_path=ROOT / expert_result.output_video_path,
@@ -481,18 +498,35 @@ async def run_compare(
         dtw_matches=dtw_result["matches"],
         output_path=dtw_preview_path,
     )
+    run_summary_payload = build_run_summary_payload(
+        run_id=run_id,
+        expert_frames_payload=expert_frames_payload,
+        learner_frames_payload=learner_frames_payload,
+        dtw_alignment_payload=dtw_alignment_payload,
+        learner_comparison_payload=learner_comparison_payload,
+    )
+    run_summary_path = run_dir / "run_summary.json"
+    write_json_file(run_summary_path, run_summary_payload)
+    print("Saved run_summary.json")
 
     return {
         "run_id": run_id,
-        "expert_output_video_url": output_media_url(ROOT / expert_result.output_video_path),
-        "learner_output_video_url": output_media_url(ROOT / learner_result.output_video_path),
+        "expert_output_video_url": storage_url(ROOT / expert_result.output_video_path),
+        "learner_output_video_url": storage_url(ROOT / learner_result.output_video_path),
         "dtw_aligned_preview_video_url": storage_url(dtw_preview_path),
-        "expert_json_url": output_media_url(ROOT / expert_result.json_path),
-        "learner_json_url": output_media_url(ROOT / learner_result.json_path),
+        "expert_frames_json_url": storage_url(ROOT / expert_result.json_path),
+        "learner_frames_json_url": storage_url(ROOT / learner_first_pass.json_path),
+        "expert_json_url": storage_url(ROOT / expert_result.json_path),
+        "learner_json_url": storage_url(ROOT / learner_first_pass.json_path),
+        "dtw_alignment_json_url": storage_url(dtw_alignment_path),
+        "learner_angle_comparison_json_url": storage_url(learner_comparison_path),
+        "run_summary_json_url": storage_url(run_summary_path),
         "expert_fps": expert_result.fps,
         "learner_fps": learner_result.fps,
-        "expert_reference_angle": expert_reference_angle,
-        "learner_frames": learner_result.learner_frames,
+        "normalized_dtw_distance": run_summary_payload["normalized_dtw_distance"],
+        "mean_angle_difference": run_summary_payload["mean_angle_difference"],
+        "median_angle_difference": run_summary_payload["median_angle_difference"],
+        "max_angle_difference": run_summary_payload["max_angle_difference"],
         "dtw": dtw_result,
     }
 
@@ -586,6 +620,8 @@ def process_video_with_scissors_line(
     output_dir: Path = DATA_OUTPUT,
     output_video_name: str | None = None,
     output_json_name: str | None = None,
+    video_type: str | None = None,
+    write_json: bool = True,
 ) -> ProcessedVideoResult:
     cap = cv2.VideoCapture(str(input_path))
     if not cap.isOpened():
@@ -639,6 +675,10 @@ def process_video_with_scissors_line(
             all_detections_count = 0
             line_center = None
             line_angle = None
+            line_start = None
+            line_end = None
+            line_source = "none"
+            fallback_used = False
             angle_difference = None
             frame_ref_angle: float | None = None
             valid_line = False
@@ -695,15 +735,26 @@ def process_video_with_scissors_line(
                 bbox_angle = angle_from_points((x1, y1), (x2, y2))
                 blade_angle = estimate_blade_angle_from_crop(frame, (x1, y1, x2, y2))
                 if previous_angle is None:
-                    angle_to_draw = blade_angle if blade_angle is not None else bbox_angle
+                    if blade_angle is not None:
+                        angle_to_draw = blade_angle
+                        line_source = "fitline"
+                    else:
+                        angle_to_draw = bbox_angle
+                        line_source = "bbox_diagonal"
+                        fallback_used = True
                 elif blade_angle is None or confidence < LOW_CONFIDENCE_ANGLE_THRESHOLD:
                     angle_to_draw = previous_angle
+                    line_source = "previous_frame"
+                    fallback_used = True
                 else:
                     jump = abs(angle_delta_degrees(previous_angle, blade_angle))
                     if jump > ANGLE_JUMP_LIMIT_DEGREES:
                         angle_to_draw = previous_angle
+                        line_source = "previous_frame"
+                        fallback_used = True
                     else:
                         angle_to_draw = smooth_angle(previous_angle, blade_angle)
+                        line_source = "fitline"
 
                 # Determine the per-frame expert reference angle.
                 # A DTW-based mapping takes priority; the fixed median is the fallback.
@@ -725,6 +776,8 @@ def process_video_with_scissors_line(
                     cv2.line(frame, ref_start, ref_end, (255, 0, 0), 3)
 
                 start, end = extend_angle_line(angle_to_draw, center_x, center_y, width, height)
+                line_start = [int(start[0]), int(start[1])]
+                line_end = [int(end[0]), int(end[1])]
                 cv2.line(frame, start, end, (0, 255, 0), 4)
                 previous_angle = angle_to_draw
                 line_angle = round(float(angle_to_draw), 6)
@@ -764,6 +817,10 @@ def process_video_with_scissors_line(
                     "bbox": bbox,
                     "line_center": line_center,
                     "line_angle": line_angle,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "line_source": line_source,
+                    "fallback_used": fallback_used,
                     "expert_reference_angle": (
                         round(float(frame_ref_angle), 6)
                         if frame_ref_angle is not None and valid_line
@@ -814,27 +871,37 @@ def process_video_with_scissors_line(
         out_video_path.unlink()
     tmp_mp4_path.replace(out_video_path)
 
-    payload = {
-        "input_video": input_path.relative_to(ROOT).as_posix(),
-        "frame_count": frame_index,
-        "frame_stride": frame_stride,
-        "detections_count": detections_count,
-        "model_path": YOLO_MODEL_PATH.relative_to(ROOT).as_posix(),
-        "confidence_threshold": YOLO_CONFIDENCE,
-        "expert_reference_angle": (
-            round(float(expert_reference_angle), 6)
-            if expert_reference_angle is not None
-            else None
-        ),
-        "learner_frames": learner_frames,
-        "frames": frames,
-    }
+    if video_type is not None:
+        payload = build_video_frames_payload(
+            video_type=video_type,
+            input_path=input_path,
+            total_frames=frame_index,
+            fps=float(fps),
+            frames=frames,
+        )
+    else:
+        payload = {
+            "input_video": input_path.relative_to(ROOT).as_posix(),
+            "frame_count": frame_index,
+            "frame_stride": frame_stride,
+            "detections_count": detections_count,
+            "model_path": YOLO_MODEL_PATH.relative_to(ROOT).as_posix(),
+            "confidence_threshold": YOLO_CONFIDENCE,
+            "expert_reference_angle": (
+                round(float(expert_reference_angle), 6)
+                if expert_reference_angle is not None
+                else None
+            ),
+            "learner_frames": learner_frames,
+            "frames": frames,
+        }
 
-    out_json_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    if write_json:
+        write_json_file(out_json_path, payload)
 
     return ProcessedVideoResult(
         output_video_path=out_video_path.relative_to(ROOT).as_posix(),
-        json_path=out_json_path.relative_to(ROOT).as_posix(),
+        json_path=out_json_path.relative_to(ROOT).as_posix() if write_json else "",
         frame_count=frame_index,
         frame_stride=frame_stride,
         fps=round(float(fps), 6),
@@ -846,6 +913,99 @@ def process_video_with_scissors_line(
         ),
         learner_frames=learner_frames,
     )
+
+
+def write_json_file(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def build_video_frames_payload(
+    *,
+    video_type: str,
+    input_path: Path,
+    total_frames: int,
+    fps: float,
+    frames: list[dict],
+) -> dict:
+    return {
+        "video_type": video_type,
+        "video_path": input_path.relative_to(ROOT).as_posix(),
+        "total_frames": total_frames,
+        "fps": round(float(fps), 6),
+        "frames": [format_video_frame_record(frame, fps) for frame in frames],
+    }
+
+
+def format_video_frame_record(frame: dict, fps: float) -> dict:
+    frame_index = int(frame["frame_index"])
+    valid_line = bool(frame.get("valid_line"))
+    bbox = bbox_to_dict(frame.get("bbox")) if frame.get("bbox") is not None else None
+    line_center = point_to_dict(frame.get("line_center")) if frame.get("line_center") is not None else None
+    line_start = point_to_dict(frame.get("line_start")) if frame.get("line_start") is not None else None
+    line_end = point_to_dict(frame.get("line_end")) if frame.get("line_end") is not None else None
+    detected = bbox is not None
+
+    if not detected or not valid_line:
+        return {
+            "frame_index": frame_index,
+            "timestamp_sec": frame_timestamp(frame_index, fps),
+            "detected": detected,
+            "valid_line": False,
+            "confidence": round_optional(frame.get("confidence")) if detected else None,
+            "bbox": bbox if detected else None,
+            "line_center": None,
+            "line_angle": None,
+            "line_start": None,
+            "line_end": None,
+            "line_source": "none",
+            "fallback_used": False,
+        }
+
+    return {
+        "frame_index": frame_index,
+        "timestamp_sec": frame_timestamp(frame_index, fps),
+        "detected": detected,
+        "valid_line": True,
+        "confidence": round_optional(frame.get("confidence")),
+        "bbox": bbox,
+        "line_center": line_center,
+        "line_angle": round_optional(frame.get("line_angle")),
+        "line_start": line_start,
+        "line_end": line_end,
+        "line_source": frame.get("line_source") or "none",
+        "fallback_used": bool(frame.get("fallback_used", False)),
+    }
+
+
+def bbox_to_dict(bbox: list[float] | tuple[float, ...]) -> dict:
+    x1, y1, x2, y2 = [float(value) for value in bbox]
+    return {
+        "x1": round(x1, 3),
+        "y1": round(y1, 3),
+        "x2": round(x2, 3),
+        "y2": round(y2, 3),
+        "width": round(max(0.0, x2 - x1), 3),
+        "height": round(max(0.0, y2 - y1), 3),
+    }
+
+
+def point_to_dict(point: list[float] | tuple[float, ...]) -> dict:
+    x, y = [float(value) for value in point]
+    return {
+        "x": round(x, 3),
+        "y": round(y, 3),
+    }
+
+
+def round_optional(value: Any, digits: int = 6) -> float | None:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def frame_timestamp(frame_index: int, fps: float) -> float:
+    return round(float(frame_index) / max(float(fps), 1e-6), 6)
 
 
 def _result_names(result: Any, model: YOLO) -> dict[int, str]:
@@ -879,6 +1039,7 @@ def extract_valid_line_frames(json_path: Path) -> list[dict]:
     frames = [
         {
             "frame_index": int(frame["frame_index"]),
+            "timestamp_sec": float(frame.get("timestamp_sec", 0.0)),
             "line_angle": float(frame["line_angle"]),
         }
         for frame in payload.get("frames", [])
@@ -907,12 +1068,220 @@ def add_frame_indices_to_dtw_matches(
                 **match,
                 "expert_frame_index": expert_frame["frame_index"],
                 "learner_frame_index": learner_frame["frame_index"],
+                "expert_timestamp_sec": expert_frame.get("timestamp_sec", 0.0),
+                "learner_timestamp_sec": learner_frame.get("timestamp_sec", 0.0),
+                "angle_difference": round(
+                    angle_difference_degrees(
+                        float(match["expert_angle"]),
+                        float(match["learner_angle"]),
+                    ),
+                    6,
+                ),
             }
         )
 
     return {
         **dtw_result,
         "matches": enriched_matches,
+    }
+
+
+def build_dtw_alignment_payload(
+    dtw_result: dict,
+    *,
+    expert_valid_frame_count: int,
+    learner_valid_frame_count: int,
+) -> dict:
+    matches = []
+    for step, match in enumerate(dtw_result.get("matches", [])):
+        matches.append(
+            {
+                "dtw_step": step,
+                "expert_seq_index": int(match["expert_index"]),
+                "learner_seq_index": int(match["learner_index"]),
+                "expert_frame_index": int(match["expert_frame_index"]),
+                "learner_frame_index": int(match["learner_frame_index"]),
+                "expert_timestamp_sec": round(float(match.get("expert_timestamp_sec", 0.0)), 6),
+                "learner_timestamp_sec": round(float(match.get("learner_timestamp_sec", 0.0)), 6),
+                "expert_angle": round(float(match["expert_angle"]), 6),
+                "learner_angle": round(float(match["learner_angle"]), 6),
+                "angle_difference": round(float(match["angle_difference"]), 6),
+            }
+        )
+
+    return {
+        "dtw_distance": round(float(dtw_result["dtw_distance"]), 6),
+        "normalized_distance": round(float(dtw_result["normalized_distance"]), 6),
+        "num_matches": len(matches),
+        "expert_valid_frame_count": expert_valid_frame_count,
+        "learner_valid_frame_count": learner_valid_frame_count,
+        "matches": matches,
+    }
+
+
+def build_learner_comparison_payload(
+    *,
+    learner_frames_payload: dict,
+    dtw_alignment_payload: dict,
+) -> dict:
+    direct_matches: dict[int, list[dict]] = {}
+    for match in dtw_alignment_payload["matches"]:
+        learner_frame_index = int(match["learner_frame_index"])
+        direct_matches.setdefault(learner_frame_index, []).append(
+            {
+                "expert_frame_index": int(match["expert_frame_index"]),
+                "expert_timestamp_sec": float(match["expert_timestamp_sec"]),
+                "expert_angle": float(match["expert_angle"]),
+            }
+        )
+
+    direct_frame_indices = sorted(direct_matches)
+    frames = []
+    for learner_frame in learner_frames_payload["frames"]:
+        frame_index = int(learner_frame["frame_index"])
+        learner_angle = learner_frame.get("line_angle")
+        matched = resolve_learner_match(
+            frame_index=frame_index,
+            direct_matches=direct_matches,
+            direct_frame_indices=direct_frame_indices,
+        )
+
+        matched_angle = matched.get("matched_expert_angle")
+        angle_difference = (
+            round(angle_difference_degrees(float(learner_angle), float(matched_angle)), 6)
+            if learner_angle is not None and matched_angle is not None
+            else None
+        )
+
+        frames.append(
+            {
+                "frame_index": frame_index,
+                "timestamp_sec": learner_frame["timestamp_sec"],
+                "learner_detected": learner_frame["detected"],
+                "learner_valid_line": learner_frame["valid_line"],
+                "learner_angle": learner_angle,
+                "learner_line_center": learner_frame["line_center"],
+                "matched_expert_frame_index": matched.get("matched_expert_frame_index"),
+                "matched_expert_timestamp_sec": matched.get("matched_expert_timestamp_sec"),
+                "matched_expert_angle": matched_angle,
+                "match_source": matched.get("match_source"),
+                "angle_difference": angle_difference,
+                "error_level": error_level(angle_difference),
+            }
+        )
+
+    return {
+        "video_type": "learner_comparison",
+        "reference_mode": "dynamic_dtw_expert_angle",
+        "frames": frames,
+    }
+
+
+def resolve_learner_match(
+    *,
+    frame_index: int,
+    direct_matches: dict[int, list[dict]],
+    direct_frame_indices: list[int],
+) -> dict:
+    if not direct_frame_indices:
+        return {
+            "matched_expert_frame_index": None,
+            "matched_expert_timestamp_sec": None,
+            "matched_expert_angle": None,
+            "match_source": None,
+        }
+
+    match_source = "dtw_direct"
+    source_frame_index = frame_index
+    matches = direct_matches.get(frame_index)
+
+    if matches is None:
+        previous_indices = [idx for idx in direct_frame_indices if idx < frame_index]
+        if previous_indices:
+            source_frame_index = previous_indices[-1]
+            matches = direct_matches[source_frame_index]
+            match_source = "nearest_previous"
+        else:
+            next_indices = [idx for idx in direct_frame_indices if idx > frame_index]
+            if not next_indices:
+                return {
+                    "matched_expert_frame_index": None,
+                    "matched_expert_timestamp_sec": None,
+                    "matched_expert_angle": None,
+                    "match_source": None,
+                }
+            source_frame_index = next_indices[0]
+            matches = direct_matches[source_frame_index]
+            match_source = "nearest_next"
+
+    expert_angles = [float(match["expert_angle"]) for match in matches]
+    expert_frame_indices = [int(match["expert_frame_index"]) for match in matches]
+    expert_timestamps = [float(match["expert_timestamp_sec"]) for match in matches]
+
+    return {
+        "matched_expert_frame_index": int(round(float(statistics.median(expert_frame_indices)))),
+        "matched_expert_timestamp_sec": round(float(statistics.median(expert_timestamps)), 6),
+        "matched_expert_angle": round(float(statistics.median(expert_angles)), 6),
+        "match_source": match_source,
+        "source_learner_frame_index": source_frame_index,
+    }
+
+
+def error_level(angle_difference: float | None) -> str:
+    if angle_difference is None:
+        return "unknown"
+    if angle_difference <= 10:
+        return "ok"
+    if angle_difference <= 25:
+        return "medium"
+    return "high"
+
+
+def build_run_summary_payload(
+    *,
+    run_id: str,
+    expert_frames_payload: dict,
+    learner_frames_payload: dict,
+    dtw_alignment_payload: dict,
+    learner_comparison_payload: dict,
+) -> dict:
+    expert_total_frames = int(expert_frames_payload["total_frames"])
+    learner_total_frames = int(learner_frames_payload["total_frames"])
+    expert_valid_lines = sum(1 for frame in expert_frames_payload["frames"] if frame["valid_line"])
+    learner_valid_lines = sum(1 for frame in learner_frames_payload["frames"] if frame["valid_line"])
+    angle_differences = [
+        float(frame["angle_difference"])
+        for frame in learner_comparison_payload["frames"]
+        if frame.get("angle_difference") is not None
+    ]
+
+    return {
+        "run_id": run_id,
+        "expert_total_frames": expert_total_frames,
+        "learner_total_frames": learner_total_frames,
+        "expert_valid_lines": expert_valid_lines,
+        "learner_valid_lines": learner_valid_lines,
+        "expert_valid_ratio": round(expert_valid_lines / max(expert_total_frames, 1), 6),
+        "learner_valid_ratio": round(learner_valid_lines / max(learner_total_frames, 1), 6),
+        "dtw_distance": dtw_alignment_payload["dtw_distance"],
+        "normalized_dtw_distance": dtw_alignment_payload["normalized_distance"],
+        "num_dtw_matches": dtw_alignment_payload["num_matches"],
+        "mean_angle_difference": (
+            round(float(statistics.mean(angle_differences)), 6) if angle_differences else None
+        ),
+        "median_angle_difference": (
+            round(float(statistics.median(angle_differences)), 6) if angle_differences else None
+        ),
+        "max_angle_difference": round(max(angle_differences), 6) if angle_differences else None,
+        "high_error_frame_count": sum(
+            1 for frame in learner_comparison_payload["frames"] if frame["error_level"] == "high"
+        ),
+        "medium_error_frame_count": sum(
+            1 for frame in learner_comparison_payload["frames"] if frame["error_level"] == "medium"
+        ),
+        "ok_frame_count": sum(
+            1 for frame in learner_comparison_payload["frames"] if frame["error_level"] == "ok"
+        ),
     }
 
 
@@ -1080,7 +1449,7 @@ def dtw_window_ratio(expert_angles: list[float], learner_angles: list[float]) ->
 
 
 def angle_difference_degrees(angle_a: float, angle_b: float) -> float:
-    angle_diff = abs(angle_a - angle_b)
+    angle_diff = abs(angle_a - angle_b) % 180
     if angle_diff > 90:
         angle_diff = 180 - angle_diff
     return abs(angle_diff)
