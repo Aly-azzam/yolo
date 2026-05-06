@@ -1,12 +1,19 @@
+# Web API and upload handling
 fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
-inference-sdk
+pydantic
+
+# YOLO inference and video/image processing
+ultralytics
+torch
 opencv-python
 numpy
-torch
-ultralytics
+
+# Browser-playable MP4 transcoding
+imageio-ffmpeg
+
+# Optional SAM2/local model helpers used by app/services/sam2
 hydra-core
 omegaconf
-imageio-ffmpeg
